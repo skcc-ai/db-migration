@@ -1,0 +1,54 @@
+# db-migration 설정 예제
+# DSN 은 ${ENV_VAR} 형태로 환경변수를 참조할 수 있습니다.
+
+source:
+  dsn: ${SOURCE_DSN}        # 예: postgresql://user:pass@host:5432/dbname
+  schema: public
+
+destination:
+  dsn: ${DEST_DSN}
+  schema: public
+
+# 기본 복사 모드: truncate | append | upsert
+#   truncate : 복사 전에 대상 테이블을 비움 (선택된 truncate 테이블 전체를 한 번에 TRUNCATE)
+#   append   : 기존 데이터 유지하고 추가
+#   upsert   : PK(또는 unique 제약) 기준으로 INSERT ... ON CONFLICT DO UPDATE
+mode: append
+
+# true 면 소스 스키마의 모든 테이블을 복사 (exclude 제외).
+# false 면 tables 에 나열된 테이블만 복사.
+copy_all: false
+
+# copy_all: true 일 때 제외할 테이블
+exclude:
+  - audit_log
+  - schema_migrations
+
+# 복사할 테이블 (copy_all: false) 또는 테이블별 override (copy_all: true)
+tables:
+  - users                       # 이름만 적으면 전체 복사
+  - name: orders
+    where: "created_at >= '2024-01-01'"   # 소스 테이블에 적용될 WHERE 절 (SQL 그대로)
+    mode: upsert                          # 이 테이블만 모드 override
+  - name: order_items
+    where: "order_id IN (SELECT id FROM orders WHERE created_at >= '2024-01-01')"
+
+# 수동 순서 지정 (선택). 여기 적힌 테이블이 이 순서대로 먼저 복사되고,
+# 나머지는 FK 기준으로 자동 정렬됩니다. 순환 참조가 있을 때 사용하세요.
+# order:
+#   - users
+#   - orders
+
+# truncate 대상 테이블을 복사 대상이 아닌 다른 테이블이 FK 로 참조할 때
+# 그 테이블까지 함께 비울지 여부. 기본 false (에러로 중단).
+truncate_cascade: false
+
+# 복사 중 대상 테이블의 사용자 트리거를 끌지 여부 (테이블 소유자 권한 필요)
+disable_triggers: false
+
+# 복사 후 serial/identity 시퀀스를 MAX 값에 맞춰 재설정
+reset_sequences: true
+
+# dry-run 에서 where 조건이 있는 테이블의 실제 행 수를 count 할지 여부
+# (대용량 테이블에서 느릴 수 있으면 false)
+count_rows_on_dry_run: true
