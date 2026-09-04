@@ -26,8 +26,8 @@ Python 에서 행을 파싱하지 않아 빠릅니다.
 ```bash
 uv sync
 cp config.example.yaml config.yaml   # 설정 편집
-export SOURCE_DSN=postgresql://user:pass@src-host:5432/db
-export DEST_DSN=postgresql://user:pass@dst-host:5432/db
+export SOURCE_PASSWORD=...
+export DEST_PASSWORD=...
 
 uv run db-migration -c config.yaml --dry-run   # 계획만 확인
 uv run db-migration -c config.yaml             # 실행
@@ -41,10 +41,18 @@ uv run db-migration -c config.yaml             # 실행
 
 ```yaml
 source:
-  dsn: ${SOURCE_DSN}       # ${VAR} 는 환경변수로 치환
+  host: ${SOURCE_HOST:-localhost}   # ${VAR} 또는 ${VAR:-기본값}
+  port: 5432
+  user: app
+  password: ${SOURCE_PASSWORD}
+  database: source_db
   schema: public
 destination:
-  dsn: ${DEST_DSN}
+  host: dst-host
+  port: 5432
+  user: app
+  password: ${DEST_PASSWORD}
+  database: target_db
   schema: public
 
 mode: append               # truncate | append | upsert
@@ -68,6 +76,8 @@ count_rows_on_dry_run: true
 
 | 항목 | 설명 |
 |---|---|
+| `source` / `destination` | `host`, `port`, `user`, `password`, `database`, `schema`. `database` 만 필수이고 나머지는 libpq 기본값(`PGHOST` 등 환경변수 포함)을 따름. 대신 `dsn` 한 줄로 적어도 됨 |
+| 환경변수 치환 | 문자열 값 어디서나 `${VAR}` (없으면 에러) 또는 `${VAR:-기본값}` (없거나 비어 있으면 기본값) 사용 가능 |
 | `mode` | 기본 복사 모드. 테이블별 `mode` 로 override 가능 |
 | `copy_all` | `true` 면 소스 스키마 전체 테이블 (파티션 자식 제외). `false` 면 `tables` 에 적힌 것만 |
 | `exclude` | `copy_all: true` 일 때 제외할 테이블 |

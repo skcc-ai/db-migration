@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+from psycopg.conninfo import make_conninfo
 
 CopyMode = Literal["truncate", "append", "upsert"]
 VALID_MODES: tuple[str, ...] = ("truncate", "append", "upsert")
 
-_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# ${VAR} 또는 ${VAR:-기본값}. 기본값 안에는 } 를 쓸 수 없다.
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
 class ConfigError(Exception):
@@ -22,7 +24,7 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class DbTarget:
-    """소스 또는 대상 DB 접속 정보."""
+    """소스 또는 대상 DB 접속 정보. dsn 은 개별 항목으로부터 조합된 최종 접속 문자열."""
 
     dsn: str
     schema: str
@@ -66,14 +68,21 @@ class MigrationConfig:
 
 
 def _substitute_env(value: Any) -> Any:
-    """문자열 안의 ${VAR} 를 환경변수로 치환. 없는 변수는 에러."""
+    """문자열 안의 ${VAR} 를 환경변수로 치환.
+
+    ${VAR:-기본값} 형태면 변수가 없거나 빈 문자열일 때 기본값을 쓴다.
+    기본값 없이 변수도 없으면 에러.
+    """
     if isinstance(value, str):
 
         def repl(m: re.Match[str]) -> str:
-            name = m.group(1)
-            if name not in os.environ:
-                raise ConfigError(f"환경변수 {name} 가 설정되어 있지 않습니다")
-            return os.environ[name]
+            name, default = m.group(1), m.group(2)
+            current = os.environ.get(name)
+            if current:
+                return current
+            if default is not None:
+                return default
+            raise ConfigError(f"환경변수 {name} 가 설정되어 있지 않습니다")
 
         return _ENV_PATTERN.sub(repl, value)
     if isinstance(value, dict):
@@ -83,16 +92,48 @@ def _substitute_env(value: Any) -> Any:
     return value
 
 
+_CONN_KEYS = ("host", "port", "user", "password", "database")
+
+
 def _parse_target(raw: Any, label: str) -> DbTarget:
+    """host/port/user/password/database 개별 항목 또는 dsn 으로 접속 정보를 만든다.
+
+    dsn 과 개별 항목을 같이 쓰면 개별 항목이 dsn 값을 덮어쓴다.
+    """
     if not isinstance(raw, dict):
-        raise ConfigError(f"{label} 항목은 dsn, schema 를 가진 객체여야 합니다")
-    dsn = raw.get("dsn")
+        raise ConfigError(f"{label} 항목은 host, database 등을 가진 객체여야 합니다")
+
     schema = raw.get("schema", "public")
-    if not dsn or not isinstance(dsn, str):
-        raise ConfigError(f"{label}.dsn 이 필요합니다")
     if not isinstance(schema, str) or not schema:
         raise ConfigError(f"{label}.schema 는 비어있지 않은 문자열이어야 합니다")
-    return DbTarget(dsn=dsn, schema=schema)
+
+    dsn = raw.get("dsn")
+    if dsn is not None and (not isinstance(dsn, str) or not dsn):
+        raise ConfigError(f"{label}.dsn 은 비어있지 않은 문자열이어야 합니다")
+
+    parts: dict[str, Any] = {}
+    for key in _CONN_KEYS:
+        value = raw.get(key)
+        if value is None or value == "":
+            continue
+        if key == "port":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise ConfigError(f"{label}.port 는 숫자여야 합니다 (입력값: {value!r})") from None
+        elif not isinstance(value, str):
+            value = str(value)
+        # psycopg 는 database 대신 dbname 키워드를 쓴다
+        parts["dbname" if key == "database" else key] = value
+
+    if dsn is None and "dbname" not in parts:
+        raise ConfigError(f"{label}.database 가 필요합니다 (또는 dsn 을 지정하세요)")
+
+    try:
+        conninfo = make_conninfo(dsn or "", **parts)
+    except Exception as exc:  # psycopg.ProgrammingError 등
+        raise ConfigError(f"{label} 접속 정보가 잘못되었습니다: {exc}") from None
+    return DbTarget(dsn=conninfo, schema=schema)
 
 
 def _parse_mode(raw: Any, label: str) -> CopyMode:

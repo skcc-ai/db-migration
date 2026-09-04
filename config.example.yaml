@@ -1,13 +1,28 @@
 # db-migration 설정 예제
-# DSN 은 ${ENV_VAR} 형태로 환경변수를 참조할 수 있습니다.
+# 문자열 값 안에서 ${ENV_VAR} 로 환경변수를 참조할 수 있습니다.
+#   ${VAR}         : 환경변수 값. 없으면 에러
+#   ${VAR:-기본값}  : 환경변수가 없거나 비어 있으면 기본값 사용
 
 source:
-  dsn: ${SOURCE_DSN}        # 예: postgresql://user:pass@host:5432/dbname
-  schema: public
+  host: ${SOURCE_HOST:-localhost}
+  port: ${SOURCE_PORT:-5432}
+  user: ${SOURCE_USER:-postgres}
+  password: ${SOURCE_PASSWORD}      # 기본값 없음: 환경변수가 반드시 있어야 함
+  database: source_db
+  schema: public                    # 생략하면 public
 
 destination:
-  dsn: ${DEST_DSN}
+  host: ${DEST_HOST:-localhost}
+  port: ${DEST_PORT:-5432}
+  user: ${DEST_USER:-postgres}
+  password: ${DEST_PASSWORD}
+  database: target_db
   schema: public
+
+# 개별 항목 대신 dsn 한 줄로 적어도 됩니다. 둘 다 있으면 개별 항목이 dsn 값을 덮어씁니다.
+# destination:
+#   dsn: postgresql://user:pass@host:5432/dbname
+#   schema: public
 
 # 기본 복사 모드: truncate | append | upsert
 #   truncate : 복사 전에 대상 테이블을 비움 (선택된 truncate 테이블 전체를 한 번에 TRUNCATE)
