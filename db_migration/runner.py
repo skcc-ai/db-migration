@@ -205,23 +205,81 @@ def _truncate(
     on_event(Event("truncate", f"TRUNCATE 완료: {', '.join(targets)}"))
 
 
+class _Connections:
+    """소스/대상 연결을 보관하고, 끊긴 연결을 다시 맺는다."""
+
+    def __init__(self, config: MigrationConfig, src: psycopg.Connection, dst: psycopg.Connection) -> None:
+        self.config = config
+        self.src = src
+        self.dst = dst
+
+    @staticmethod
+    def _is_broken(conn: psycopg.Connection) -> bool:
+        return conn.closed or conn.broken
+
+    def reconnect_if_broken(self, on_event: EventListener) -> None:
+        """끊긴 연결을 감지해 다시 연결한다. 소스 재접속 시 스냅샷이 새로 잡힌다."""
+        if self._is_broken(self.src):
+            try:
+                self.src.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.src = db.connect(self.config.source.dsn, self.config.source.schema)
+            _begin_source_snapshot(self.src)
+            on_event(Event("warning", "소스 연결이 끊겨 다시 연결했습니다. 이후 테이블은 새 스냅샷에서 읽습니다"))
+        if self._is_broken(self.dst):
+            try:
+                self.dst.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.dst = db.connect(self.config.destination.dsn, self.config.destination.schema)
+            on_event(Event("warning", "대상 연결이 끊겨 다시 연결했습니다"))
+
+    def close(self) -> None:
+        for conn in (self.src, self.dst):
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _begin_source_snapshot(src: psycopg.Connection) -> None:
+    """소스를 REPEATABLE READ 읽기 전용으로 설정. psycopg 가 첫 쿼리에서 암묵적으로 트랜잭션을 연다."""
+    src.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    src.read_only = True
+
+
+def _safe_rollback(conn: psycopg.Connection) -> None:
+    """끊긴 연결에서도 예외 없이 롤백을 시도한다."""
+    try:
+        if not (conn.closed or conn.broken):
+            conn.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def execute_plan(
     config: MigrationConfig,
     plan: MigrationPlan,
     src: psycopg.Connection,
     dst: psycopg.Connection,
     on_event: EventListener = _noop,
+    conns: _Connections | None = None,
 ) -> MigrationResult:
-    """계획을 실행한다. 테이블마다 별도 트랜잭션이며, 실패한 테이블과 그 하위 테이블은 건너뛴다."""
+    """계획을 실행한다. 테이블마다 별도 트랜잭션이며, 실패한 테이블과 그 하위 테이블은 건너뛴다.
+
+    연결이 끊기면 (stall_timeout 포함) 다시 연결해서 다음 테이블을 계속 진행한다.
+    재접속으로 연결 객체가 바뀔 수 있으므로, 호출자가 conns 를 넘기면 거기에 최신 연결이 남는다.
+    """
     for w in plan.warnings:
         on_event(Event("warning", w))
 
     _truncate(config, dst, plan.truncate_targets, on_event)
 
-    # 소스는 하나의 REPEATABLE READ 스냅샷에서 읽어 테이블 간 일관성을 유지.
-    # psycopg 가 첫 쿼리에서 암묵적으로 트랜잭션을 열므로 속성만 설정한다.
-    src.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
-    src.read_only = True
+    if conns is None:
+        conns = _Connections(config, src, dst)
+    # 소스는 하나의 REPEATABLE READ 스냅샷에서 읽어 테이블 간 일관성을 유지
+    _begin_source_snapshot(conns.src)
 
     results: list[TableResult] = []
     failed: set[str] = set()
@@ -267,8 +325,8 @@ def execute_plan(
 
             try:
                 rows = copy_table(
-                    src,
-                    dst,
+                    conns.src,
+                    conns.dst,
                     config.source.schema,
                     config.destination.schema,
                     table,
@@ -277,21 +335,26 @@ def execute_plan(
                     on_progress=on_progress if config.progress_interval > 0 else None,
                     on_phase=on_phase,
                     progress_interval=config.progress_interval,
+                    stall_timeout=config.stall_timeout,
                 )
-                dst.commit()
+                conns.dst.commit()
                 result = TableResult(table.name, "success", rows=rows, elapsed=time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - 테이블 단위로 격리하고 계속 진행
-                dst.rollback()
+                _safe_rollback(conns.dst)
                 # 소스 쪽 COPY 가 중간에 끊기면 트랜잭션이 깨질 수 있으므로 정리한다 (다음 쿼리에서 새 스냅샷)
-                src.rollback()
+                _safe_rollback(conns.src)
                 failed.add(table.name)
                 result = TableResult(
                     table.name, "failed", elapsed=time.monotonic() - started, message=_first_line(exc)
                 )
+                results.append(result)
+                on_event(Event("table_done", result.message, table=table.name, result=result))
+                conns.reconnect_if_broken(on_event)
+                continue
             results.append(result)
             on_event(Event("table_done", result.message, table=table.name, result=result))
     finally:
-        src.rollback()
+        _safe_rollback(conns.src)
 
     return MigrationResult(results=results, warnings=list(plan.warnings))
 
@@ -303,10 +366,14 @@ def run_migration(
     on_event: EventListener = _noop,
 ) -> tuple[MigrationPlan, MigrationResult | None]:
     """설정으로 연결을 열고 계획을 세운 뒤, dry_run 이 아니면 실행한다."""
-    with (
-        db.connect(config.source.dsn, config.source.schema) as src,
-        db.connect(config.destination.dsn, config.destination.schema) as dst,
-    ):
+    src = db.connect(config.source.dsn, config.source.schema)
+    try:
+        dst = db.connect(config.destination.dsn, config.destination.schema)
+    except Exception:
+        src.close()
+        raise
+    conns = _Connections(config, src, dst)
+    try:
         plan = build_plan(config, src, dst, count_rows=dry_run and config.count_rows_on_dry_run)
         src.rollback()  # 메타데이터 조회로 열린 트랜잭션 정리
         dst.rollback()
@@ -314,5 +381,7 @@ def run_migration(
             for w in plan.warnings:
                 on_event(Event("warning", w))
             return plan, None
-        result = execute_plan(config, plan, src, dst, on_event)
+        result = execute_plan(config, plan, src, dst, on_event, conns=conns)
         return plan, result
+    finally:
+        conns.close()

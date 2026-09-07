@@ -160,3 +160,10 @@ def test_progress_interval():
     assert parse_config(_base(progress_interval=0)).progress_interval == 0.0
     with pytest.raises(ConfigError, match="progress_interval"):
         parse_config(_base(progress_interval=-1))
+
+
+def test_stall_timeout():
+    assert parse_config(_base()).stall_timeout == 300.0
+    assert parse_config(_base(stall_timeout=0)).stall_timeout == 0.0
+    with pytest.raises(ConfigError, match="stall_timeout"):
+        parse_config(_base(stall_timeout="soon"))

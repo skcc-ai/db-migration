@@ -56,6 +56,7 @@ class MigrationConfig:
     reset_sequences: bool = True
     count_rows_on_dry_run: bool = True
     progress_interval: float = 5.0  # 복사 중 진행 상황 출력 간격(초). 0 이면 출력 안 함
+    stall_timeout: float = 300.0  # 이 시간(초) 동안 데이터가 전혀 없으면 테이블 실패 처리. 0 이면 무제한 대기
 
     def table_spec(self, name: str) -> TableSpec:
         """이름으로 테이블 설정을 찾고, 없으면 기본 설정을 반환."""
@@ -220,6 +221,7 @@ def parse_config(data: dict[str, Any]) -> MigrationConfig:
             data.get("count_rows_on_dry_run"), "count_rows_on_dry_run", True
         ),
         progress_interval=_parse_number(data.get("progress_interval"), "progress_interval", 5.0),
+        stall_timeout=_parse_number(data.get("stall_timeout"), "stall_timeout", 300.0),
     )
 
     if not config.copy_all and not config.tables:

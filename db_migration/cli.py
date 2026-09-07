@@ -48,9 +48,10 @@ def _print_summary(result: MigrationResult) -> None:
 def _make_listener(verbose: bool):
     def listener(event: Event) -> None:
         if event.kind == "warning":
-            print(f"경고: {event.message}", file=sys.stderr)
+            sys.stdout.flush()  # stdout 이 파이프일 때 순서가 섞이지 않도록
+            print(f"경고: {event.message}", file=sys.stderr, flush=True)
         elif event.kind == "truncate":
-            print(event.message)
+            print(event.message, flush=True)
         elif event.kind == "table_start":
             print(f"  {event.table}: {event.message}", flush=True)
         elif event.kind == "table_progress":
@@ -58,9 +59,9 @@ def _make_listener(verbose: bool):
         elif event.kind == "table_done" and event.result is not None:
             r = event.result
             if r.status == "success":
-                print(f"  {r.name}: 완료 ({_fmt_rows(r.rows)} 행, {r.elapsed:.1f}s)")
+                print(f"  {r.name}: 완료 ({_fmt_rows(r.rows)} 행, {r.elapsed:.1f}s)", flush=True)
             else:
-                print(f"  {r.name}: {r.status} - {r.message}")
+                print(f"  {r.name}: {r.status} - {r.message}", flush=True)
         elif verbose:
             print(event.message)
 

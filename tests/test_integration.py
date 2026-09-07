@@ -364,3 +364,24 @@ def test_progress_reports_stall_while_waiting_for_source(conn):
     stalls = [e for e in events if e.kind == "table_progress" and "데이터 없음" in e.message]
     assert stalls, [e.message for e in events]
     assert any("소스에서 다음 데이터 수신" in e.message for e in stalls)
+
+
+def test_stall_timeout_fails_table_reconnects_and_continues(conn):
+    # users 는 행마다 3초씩 멈추므로 stall_timeout 1초에 걸린다. 이후 products 는 정상 복사되어야 한다.
+    events: list[Event] = []
+    cfg = _config(
+        copy_all=False,
+        tables=[{"name": "users", "where": "pg_sleep(3) IS NOT NULL"}, "products"],
+        progress_interval=0,
+        stall_timeout=1,
+    )
+    _, result = run_migration(cfg, on_event=events.append)
+    statuses = _statuses(result)
+    assert statuses["users"] == "failed"
+    assert statuses["products"] == "success"
+    users = next(r for r in result.results if r.name == "users")
+    assert "데이터가 없어 중단" in users.message
+    assert users.elapsed < 3, users.elapsed  # 3초 전에 끊어야 한다
+    assert any(e.kind == "warning" and "다시 연결" in e.message for e in events)
+    assert _count(conn, "users") == 0  # 롤백됨
+    assert _count(conn, "products") == 2
