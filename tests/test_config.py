@@ -4,7 +4,7 @@ import pytest
 
 from psycopg.conninfo import conninfo_to_dict
 
-from db_migration.config import ConfigError, parse_config
+from db_migration.config import ConfigError, load_config, parse_config
 
 
 def _base(**overrides):
@@ -114,3 +114,42 @@ def test_duplicate_table_rejected():
 def test_duplicate_order_rejected():
     with pytest.raises(ConfigError, match="order"):
         parse_config(_base(order=["a", "a"]))
+
+
+def test_load_config_reads_env_next_to_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOTENV_PW", raising=False)
+    (tmp_path / ".env").write_text("DOTENV_PW=from-dotenv\n")
+    (tmp_path / "config.yaml").write_text(
+        "source: {host: h, database: d, password: '${DOTENV_PW}'}\n"
+        "destination: {host: h, database: d}\n"
+        "tables: [users]\n"
+    )
+    cfg = load_config(tmp_path / "config.yaml")
+    assert conninfo_to_dict(cfg.source.dsn)["password"] == "from-dotenv"
+
+
+def test_shell_env_wins_over_dotenv(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOTENV_PW2", "from-shell")
+    (tmp_path / ".env").write_text("DOTENV_PW2=from-dotenv\n")
+    (tmp_path / "config.yaml").write_text(
+        "source: {host: h, database: d, password: '${DOTENV_PW2}'}\n"
+        "destination: {host: h, database: d}\n"
+        "tables: [users]\n"
+    )
+    cfg = load_config(tmp_path / "config.yaml")
+    assert conninfo_to_dict(cfg.source.dsn)["password"] == "from-shell"
+
+
+def test_explicit_env_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOTENV_PW3", raising=False)
+    env = tmp_path / "prod.env"
+    env.write_text("DOTENV_PW3=prod\n")
+    (tmp_path / "config.yaml").write_text(
+        "source: {host: h, database: d, password: '${DOTENV_PW3}'}\n"
+        "destination: {host: h, database: d}\n"
+        "tables: [users]\n"
+    )
+    cfg = load_config(tmp_path / "config.yaml", env_file=env)
+    assert conninfo_to_dict(cfg.source.dsn)["password"] == "prod"
+    with pytest.raises(ConfigError, match="env 파일"):
+        load_config(tmp_path / "config.yaml", env_file=tmp_path / "missing.env")

@@ -25,15 +25,18 @@ Python 에서 행을 파싱하지 않아 빠릅니다.
 
 ```bash
 uv sync
-cp config.example.yaml config.yaml   # 설정 편집
-export SOURCE_PASSWORD=...
-export DEST_PASSWORD=...
+cp config.example.yaml config.yaml   # 테이블, 모드 등 설정 편집
+cp .env.example .env                 # 접속 정보(비밀번호 등) 입력
 
-uv run db-migration -c config.yaml --dry-run   # 계획만 확인
-uv run db-migration -c config.yaml             # 실행
+uv run db-migration --dry-run                  # 계획만 확인 (현재 폴더의 config.yaml 사용)
+uv run db-migration                            # 실행
+uv run db-migration -c other.yaml              # 다른 설정 파일 지정
+uv run db-migration --env-file prod.env        # 다른 .env 사용
 ```
 
 종료 코드: 0 성공, 1 실패한 테이블 있음, 2 설정 오류 또는 실행 전 중단.
+
+`config.yaml` 과 `.env` 는 `.gitignore` 에 포함되어 있어 커밋되지 않습니다.
 
 ## 설정 파일
 
@@ -78,6 +81,7 @@ count_rows_on_dry_run: true
 |---|---|
 | `source` / `destination` | `host`, `port`, `user`, `password`, `database`, `schema`. `database` 만 필수이고 나머지는 libpq 기본값(`PGHOST` 등 환경변수 포함)을 따름. 대신 `dsn` 한 줄로 적어도 됨 |
 | 환경변수 치환 | 문자열 값 어디서나 `${VAR}` (없으면 에러) 또는 `${VAR:-기본값}` (없거나 비어 있으면 기본값) 사용 가능 |
+| `.env` | 설정 파일과 같은 폴더, 그 다음 현재 폴더의 `.env` 를 자동으로 읽어 환경변수로 사용. `--env-file` 로 직접 지정 가능. 셸에 이미 있는 환경변수가 `.env` 보다 우선 |
 | `mode` | 기본 복사 모드. 테이블별 `mode` 로 override 가능 |
 | `copy_all` | `true` 면 소스 스키마 전체 테이블 (파티션 자식 제외). `false` 면 `tables` 에 적힌 것만 |
 | `exclude` | `copy_all: true` 일 때 제외할 테이블 |

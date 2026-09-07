@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+from dotenv import load_dotenv
 from psycopg.conninfo import make_conninfo
 
 CopyMode = Literal["truncate", "append", "upsert"]
@@ -218,11 +219,33 @@ def parse_config(data: dict[str, Any]) -> MigrationConfig:
     return config
 
 
-def load_config(path: str | Path) -> MigrationConfig:
-    """YAML 파일을 읽어 MigrationConfig 로 변환."""
+def load_env_file(config_path: Path, env_file: str | Path | None = None) -> Path | None:
+    """.env 파일을 읽어 환경변수로 올린다. 이미 설정된 환경변수는 덮어쓰지 않는다.
+
+    env_file 을 지정하면 그 파일을 (없으면 에러), 지정하지 않으면 설정 파일과 같은 폴더의 .env,
+    그 다음 현재 작업 폴더의 .env 순서로 찾아 처음 발견한 파일 하나를 읽는다.
+    읽은 파일 경로를 반환하고, 없으면 None.
+    """
+    if env_file is not None:
+        env_path = Path(env_file)
+        if not env_path.exists():
+            raise ConfigError(f"env 파일을 찾을 수 없습니다: {env_path}")
+        load_dotenv(env_path, override=False)
+        return env_path
+
+    for candidate in (config_path.resolve().parent / ".env", Path.cwd() / ".env"):
+        if candidate.exists():
+            load_dotenv(candidate, override=False)
+            return candidate
+    return None
+
+
+def load_config(path: str | Path, env_file: str | Path | None = None) -> MigrationConfig:
+    """YAML 파일을 읽어 MigrationConfig 로 변환. 먼저 .env 를 읽어 ${VAR} 치환에 사용한다."""
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"설정 파일을 찾을 수 없습니다: {path}")
+    load_env_file(path, env_file)
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return parse_config(data)

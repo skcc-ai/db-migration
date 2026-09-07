@@ -9,5 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# 실제 접속 정보가 담긴 설정 파일 (config.example.yaml 은 관리함)
+# 실제 접속 정보가 담긴 파일 (config.example.yaml, .env.example 은 관리함)
 config.yaml
+.env

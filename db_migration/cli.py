@@ -70,7 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="db-migration",
         description="PostgreSQL 스키마 간 테이블 데이터 복사 도구",
     )
-    parser.add_argument("-c", "--config", required=True, help="YAML 설정 파일 경로")
+    parser.add_argument(
+        "-c", "--config", default="config.yaml", help="YAML 설정 파일 경로 (기본값: 현재 폴더의 config.yaml)"
+    )
+    parser.add_argument(
+        "--env-file",
+        help=".env 파일 경로. 생략하면 설정 파일과 같은 폴더, 그 다음 현재 폴더의 .env 를 찾음",
+    )
     parser.add_argument("--dry-run", action="store_true", help="실행 계획만 출력하고 아무것도 쓰지 않음")
     parser.add_argument("-v", "--verbose", action="store_true", help="상세 로그 출력")
     return parser
@@ -79,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        config = load_config(args.config)
+        config = load_config(args.config, env_file=args.env_file)
         plan, result = run_migration(config, dry_run=args.dry_run, on_event=_make_listener(args.verbose))
     except (ConfigError, OrderingError, MigrationError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
