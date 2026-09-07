@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 
-from .config import ConfigError, load_config
+from .config import VALID_TRANSFERS, ConfigError, load_config
 from .models import Event, MigrationPlan, MigrationResult
 from .ordering import OrderingError
 from .runner import MigrationError, run_migration
@@ -81,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=".env 파일 경로. 생략하면 설정 파일과 같은 폴더, 그 다음 현재 폴더의 .env 를 찾음",
     )
     parser.add_argument("--dry-run", action="store_true", help="실행 계획만 출력하고 아무것도 쓰지 않음")
+    parser.add_argument(
+        "--transfer",
+        choices=VALID_TRANSFERS,
+        help="전송 방식 (설정 파일의 transfer 를 덮어씀). stream: 직접 스트리밍, file: 로컬 파일 경유",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="상세 로그 출력")
     return parser
 
@@ -89,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = load_config(args.config, env_file=args.env_file)
+        if args.transfer:
+            config = replace(config, transfer=args.transfer)
         plan, result = run_migration(config, dry_run=args.dry_run, on_event=_make_listener(args.verbose))
     except (ConfigError, OrderingError, MigrationError) as exc:
         print(f"오류: {exc}", file=sys.stderr)

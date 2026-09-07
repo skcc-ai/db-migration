@@ -374,6 +374,7 @@ def test_stall_timeout_fails_table_reconnects_and_continues(conn):
         tables=[{"name": "users", "where": "pg_sleep(3) IS NOT NULL"}, "products"],
         progress_interval=0,
         stall_timeout=1,
+        retries=0,
     )
     _, result = run_migration(cfg, on_event=events.append)
     statuses = _statuses(result)
@@ -385,3 +386,155 @@ def test_stall_timeout_fails_table_reconnects_and_continues(conn):
     assert any(e.kind == "warning" and "다시 연결" in e.message for e in events)
     assert _count(conn, "users") == 0  # 롤백됨
     assert _count(conn, "products") == 2
+
+
+def test_stall_is_retried_before_failing(conn):
+    # retries=1 이면 정지 감지 후 한 번 더 시도하고 나서야 실패한다
+    events: list[Event] = []
+    cfg = _config(
+        copy_all=False,
+        tables=[{"name": "users", "where": "pg_sleep(3) IS NOT NULL"}],
+        progress_interval=0,
+        stall_timeout=1,
+        retries=1,
+    )
+    _, result = run_migration(cfg, on_event=events.append)
+    assert _statuses(result)["users"] == "failed"
+    retry_warnings = [e for e in events if e.kind == "warning" and "다시 시도" in e.message]
+    assert len(retry_warnings) == 1
+    assert "1/1" in retry_warnings[0].message
+
+
+def test_sql_error_is_not_retried(conn):
+    # 제약 위반 같은 SQL 오류는 다시 해도 같으므로 재시도하지 않는다
+    conn.execute("INSERT INTO dst.users (id, name) VALUES (1, 'dup')")
+    events: list[Event] = []
+    cfg = _config(copy_all=False, tables=["users"], retries=3)
+    _, result = run_migration(cfg, on_event=events.append)
+    assert _statuses(result)["users"] == "failed"
+    assert not [e for e in events if e.kind == "warning" and "다시 시도" in e.message]
+
+
+# ---- 파일 경유 전송 ----
+
+
+def _file_config(tmp_path, **overrides):
+    return _config(transfer="file", spool_dir=str(tmp_path), **overrides)
+
+
+def test_file_transfer_copies_everything_and_cleans_up(conn, tmp_path):
+    events: list[Event] = []
+    _, result = run_migration(_file_config(tmp_path), on_event=events.append)
+    assert result.succeeded, result.results
+    assert _count(conn, "users") == 3
+    assert _count(conn, "order_items") == 4
+    assert _count(conn, "no_pk") == 2
+    rows = {r.name: r.rows for r in result.results}
+    assert rows["users"] == 3 and rows["order_items"] == 4
+    assert list(tmp_path.iterdir()) == []  # 기본은 올린 뒤 파일 삭제
+    assert any(e.kind == "table_start" and "파일 경유" in e.message for e in events)
+    assert any(e.kind == "table_progress" and "내려받기 완료" in e.message for e in events)
+    # 시퀀스 재설정도 동작
+    assert conn.execute("SELECT nextval('dst.users_id_seq')").fetchone()[0] == 4
+
+
+def test_file_transfer_supports_all_modes_and_where(conn, tmp_path):
+    conn.execute("INSERT INTO dst.users (name) VALUES ('old1'), ('old2'), ('old3')")
+    conn.execute("UPDATE dst.users SET name = 'stale' WHERE id = 1")
+    cfg = _file_config(
+        tmp_path,
+        copy_all=False,
+        mode="upsert",
+        tables=[
+            {"name": "users"},
+            {"name": "products", "mode": "truncate"},
+            {"name": "orders", "mode": "append", "where": "created_at >= '2024-01-01'"},
+        ],
+        truncate_cascade=True,  # dst.order_items 가 products 를 참조
+    )
+    _, result = run_migration(cfg)
+    assert result.succeeded, result.results
+    assert _count(conn, "users") == 3
+    assert conn.execute("SELECT name FROM dst.users WHERE id = 1").fetchone()[0] == "alice"
+    assert _count(conn, "products") == 2
+    assert _count(conn, "orders") == 2
+
+
+def test_file_transfer_keeps_files_and_reuses_them(conn, tmp_path):
+    cfg = _file_config(tmp_path, copy_all=False, tables=["no_pk"], keep_spool_files=True)
+    _, result = run_migration(cfg)
+    assert result.succeeded
+    spool = tmp_path / "src.no_pk.copy"
+    assert spool.exists() and (tmp_path / "src.no_pk.copy.meta").exists()
+    assert spool.read_bytes().count(b"\n") == 2
+
+    # 소스를 바꿔도 재사용된 파일에서 올리므로 예전 데이터가 들어간다
+    conn.execute("DELETE FROM dst.no_pk; DELETE FROM src.no_pk")
+    events: list[Event] = []
+    _, result = run_migration(cfg, on_event=events.append)
+    assert result.succeeded
+    assert _count(conn, "no_pk") == 2
+    assert any(e.kind == "warning" and "재사용" in e.message for e in events)
+
+
+def test_file_transfer_ignores_spool_file_when_where_differs(conn, tmp_path):
+    cfg = _file_config(tmp_path, copy_all=False, tables=["users"], keep_spool_files=True)
+    assert run_migration(cfg)[1].succeeded
+    conn.execute("DELETE FROM dst.users")
+    cfg2 = _file_config(
+        tmp_path, copy_all=False, tables=[{"name": "users", "where": "id = 1"}], keep_spool_files=True
+    )
+    events: list[Event] = []
+    assert run_migration(cfg2, on_event=events.append)[1].succeeded
+    assert _count(conn, "users") == 1
+    assert not any(e.kind == "warning" and "재사용" in e.message for e in events)
+
+
+def test_file_transfer_stall_on_download_retries_and_leaves_no_partial_file(conn, tmp_path):
+    events: list[Event] = []
+    cfg = _file_config(
+        tmp_path,
+        copy_all=False,
+        tables=[{"name": "users", "where": "pg_sleep(3) IS NOT NULL"}, "products"],
+        progress_interval=0,
+        stall_timeout=1,
+        retries=1,
+    )
+    _, result = run_migration(cfg, on_event=events.append)
+    statuses = _statuses(result)
+    assert statuses["users"] == "failed"
+    assert statuses["products"] == "success"
+    assert any(e.kind == "warning" and "내려받기 실패" in e.message for e in events)
+    assert _count(conn, "users") == 0
+    assert not list(tmp_path.glob("*users*")), list(tmp_path.iterdir())
+
+
+def test_file_transfer_upload_failure_keeps_spool_file_for_next_run(conn, tmp_path):
+    # 대상에서 올리기가 실패하면 (여기서는 제약 위반) 내려받은 파일은 남겨 둔다
+    conn.execute("INSERT INTO dst.users (id, name) VALUES (1, 'dup')")
+    cfg = _file_config(tmp_path, copy_all=False, tables=["users"])
+    _, result = run_migration(cfg)
+    assert _statuses(result)["users"] == "failed"
+    assert (tmp_path / "src.users.copy").exists()
+
+    # 충돌 원인을 없애고 다시 실행하면 재사용해서 성공
+    conn.execute("DELETE FROM dst.users")
+    events: list[Event] = []
+    _, result = run_migration(cfg, on_event=events.append)
+    assert result.succeeded
+    assert any(e.kind == "warning" and "재사용" in e.message for e in events)
+    assert _count(conn, "users") == 3
+    assert not (tmp_path / "src.users.copy").exists()
+
+
+def test_file_transfer_progress_events(conn, tmp_path):
+    conn.execute("INSERT INTO src.no_pk SELECT 'row' || g FROM generate_series(1, 300000) g")
+    events: list[Event] = []
+    cfg = _file_config(tmp_path, copy_all=False, tables=["no_pk"], progress_interval=0.05)
+    _, result = run_migration(cfg, on_event=events.append)
+    assert result.succeeded
+    messages = [e.message for e in events if e.kind == "table_progress" and e.rows is not None]
+    assert any("내려받기 중" in m for m in messages), messages[:3]
+    # 로컬에서는 올리기가 순식간에 끝나 진행 이벤트가 없을 수 있으므로 단계 메시지로 확인
+    phases = [e.message for e in events if e.kind == "table_progress" and e.rows is None]
+    assert any("대상으로 올리는 중" in m for m in phases), phases

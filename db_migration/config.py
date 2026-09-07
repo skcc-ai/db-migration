@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -14,6 +15,9 @@ from psycopg.conninfo import make_conninfo
 
 CopyMode = Literal["truncate", "append", "upsert"]
 VALID_MODES: tuple[str, ...] = ("truncate", "append", "upsert")
+
+TransferMethod = Literal["stream", "file"]
+VALID_TRANSFERS: tuple[str, ...] = ("stream", "file")
 
 # ${VAR} 또는 ${VAR:-기본값}. 기본값 안에는 } 를 쓸 수 없다.
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -57,6 +61,14 @@ class MigrationConfig:
     count_rows_on_dry_run: bool = True
     progress_interval: float = 5.0  # 복사 중 진행 상황 출력 간격(초). 0 이면 출력 안 함
     stall_timeout: float = 300.0  # 이 시간(초) 동안 데이터가 전혀 없으면 테이블 실패 처리. 0 이면 무제한 대기
+    retries: int = 3  # 연결 오류(끊김, 정지)로 실패했을 때 재접속 후 다시 시도하는 횟수
+    transfer: TransferMethod = "stream"  # stream: 소스→대상 직접 스트리밍, file: 로컬 파일 경유
+    spool_dir: Path | None = None  # file 전송에서 내려받은 파일을 둘 폴더. None 이면 시스템 임시 폴더
+    keep_spool_files: bool = False  # file 전송에서 올리기가 끝난 파일을 지우지 않고 남길지 여부
+
+    def effective_spool_dir(self) -> Path:
+        """file 전송에서 실제로 사용할 폴더."""
+        return self.spool_dir if self.spool_dir is not None else Path(tempfile.gettempdir()) / "db-migration"
 
     def table_spec(self, name: str) -> TableSpec:
         """이름으로 테이블 설정을 찾고, 없으면 기본 설정을 반환."""
@@ -200,6 +212,30 @@ def _parse_number(raw: Any, label: str, default: float) -> float:
     return float(raw)
 
 
+def _parse_int(raw: Any, label: str, default: int) -> int:
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ConfigError(f"{label} 는 0 이상의 정수여야 합니다")
+    return raw
+
+
+def _parse_transfer(raw: Any) -> TransferMethod:
+    if raw is None:
+        return "stream"
+    if raw not in VALID_TRANSFERS:
+        raise ConfigError(f"transfer 는 {', '.join(VALID_TRANSFERS)} 중 하나여야 합니다 (입력값: {raw!r})")
+    return raw  # type: ignore[return-value]
+
+
+def _parse_path(raw: Any, label: str) -> Path | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw:
+        raise ConfigError(f"{label} 는 비어있지 않은 문자열이어야 합니다")
+    return Path(raw).expanduser()
+
+
 def parse_config(data: dict[str, Any]) -> MigrationConfig:
     """dict 형태의 설정을 검증하여 MigrationConfig 로 변환."""
     if not isinstance(data, dict):
@@ -222,6 +258,10 @@ def parse_config(data: dict[str, Any]) -> MigrationConfig:
         ),
         progress_interval=_parse_number(data.get("progress_interval"), "progress_interval", 5.0),
         stall_timeout=_parse_number(data.get("stall_timeout"), "stall_timeout", 300.0),
+        retries=_parse_int(data.get("retries"), "retries", 3),
+        transfer=_parse_transfer(data.get("transfer")),
+        spool_dir=_parse_path(data.get("spool_dir"), "spool_dir"),
+        keep_spool_files=_parse_bool(data.get("keep_spool_files"), "keep_spool_files", False),
     )
 
     if not config.copy_all and not config.tables:

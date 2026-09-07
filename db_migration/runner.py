@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, TypeVar
 
 import psycopg
 from psycopg import sql
 
 from . import db
 from .config import MigrationConfig
-from .copier import Progress, copy_table
+from .copier import Progress, StallError, copy_table, dump_table, load_table
 from .models import (
     Event,
     EventListener,
@@ -258,6 +263,201 @@ def _safe_rollback(conn: psycopg.Connection) -> None:
         pass
 
 
+T = TypeVar("T")
+
+# 재접속 후 다시 시도할 가치가 있는 오류. SQL 오류(제약 위반 등)는 다시 해도 같으므로 제외한다.
+_RETRYABLE = (StallError, psycopg.OperationalError, psycopg.InterfaceError, ConnectionError, TimeoutError)
+
+
+@dataclass
+class _TableContext:
+    """테이블 하나를 복사하는 동안 공유되는 것들."""
+
+    config: MigrationConfig
+    conns: _Connections
+    table: TablePlan
+    on_event: EventListener
+    started: float
+
+    def progress_handler(
+        self, verb: str, waiting_for: dict[str, str]
+    ) -> Callable[[Progress], None] | None:
+        """progress_interval 마다 호출될 콜백.
+
+        verb 는 '전송', '내려받기' 처럼 지금 하는 일, waiting_for 는 phase(read/write)별로
+        데이터가 멈췄을 때 무엇을 기다리는 중인지 설명하는 문구.
+        """
+        if self.config.progress_interval <= 0:
+            return None
+        name, t0, interval = self.table.name, self.started, self.config.progress_interval
+
+        def on_progress(p: Progress) -> None:
+            elapsed = time.monotonic() - t0
+            if p.idle_seconds >= interval:
+                # 데이터가 흐르지 않는 상태. 어느 쪽을 기다리는지 같이 보여준다.
+                waiting = waiting_for[p.phase]
+                message = (
+                    f"{p.rows:,} 행 / {_fmt_bytes(p.bytes)} {verb} 후 {p.idle_seconds:.0f}초째 데이터 없음, "
+                    f"{waiting} 대기 중 ({elapsed:.0f}s)"
+                )
+            else:
+                message = f"{p.rows:,} 행 / {_fmt_bytes(p.bytes)} {verb} 중 ({elapsed:.0f}s)"
+            self.on_event(Event("table_progress", message, table=name, rows=p.rows, bytes=p.bytes))
+
+        return on_progress
+
+    def phase(self, message: str) -> None:
+        self.on_event(Event("table_progress", message, table=self.table.name))
+
+    def with_retries(self, what: str, fn: Callable[[], T], *, source: bool, dest: bool) -> T:
+        """fn 을 실행하고, 연결 오류로 실패하면 재접속한 뒤 retries 만큼 다시 시도한다.
+
+        source / dest 는 이 단계가 사용하는 연결. 실패 시 그 연결만 롤백해서, 예를 들어 올리기가
+        실패했을 때 소스 스냅샷까지 버리지 않는다.
+        """
+        retries = self.config.retries
+        for attempt in range(retries + 1):
+            try:
+                return fn()
+            except _RETRYABLE as exc:
+                if dest:
+                    _safe_rollback(self.conns.dst)
+                if source:
+                    _safe_rollback(self.conns.src)
+                if attempt >= retries:
+                    raise
+                self.on_event(
+                    Event(
+                        "warning",
+                        f"{self.table.name}: {what} 실패 ({_first_line(exc)}). "
+                        f"다시 시도합니다 ({attempt + 1}/{retries})",
+                        table=self.table.name,
+                    )
+                )
+                self.conns.reconnect_if_broken(self.on_event)
+        raise AssertionError("unreachable")
+
+
+def _copy_streaming(ctx: _TableContext) -> int:
+    """소스에서 대상으로 직접 스트리밍. 실패하면 처음부터 다시 한다."""
+    config, table = ctx.config, ctx.table
+
+    def attempt() -> int:
+        rows = copy_table(
+            ctx.conns.src,
+            ctx.conns.dst,
+            config.source.schema,
+            config.destination.schema,
+            table,
+            disable_triggers=config.disable_triggers,
+            reset_sequences=config.reset_sequences,
+            on_progress=ctx.progress_handler("전송", {"read": "소스에서 다음 데이터 수신", "write": "대상으로 전송"}),
+            on_phase=ctx.phase,
+            progress_interval=config.progress_interval,
+            stall_timeout=config.stall_timeout,
+        )
+        ctx.conns.dst.commit()
+        return rows
+
+    return ctx.with_retries("복사", attempt, source=True, dest=True)
+
+
+def _spool_path(config: MigrationConfig, table: str) -> Path:
+    """테이블의 내려받기 파일 경로. 같은 폴더에 다른 소스 스키마의 파일이 섞여도 구분되도록 스키마를 붙인다."""
+    return config.effective_spool_dir() / f"{config.source.schema}.{table}.copy"
+
+
+def _spool_meta_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta")
+
+
+def _reusable_spool(path: Path, table: TablePlan) -> dict | None:
+    """이전 실행에서 내려받은 완전한 파일이 있고 컬럼/where 가 같으면 그 메타를 반환."""
+    meta_path = _spool_meta_path(path)
+    if not path.exists() or not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if meta.get("columns") != list(table.columns) or meta.get("where") != table.where:
+        return None
+    return meta
+
+
+def _copy_via_file(ctx: _TableContext) -> int:
+    """소스 → 로컬 파일 → 대상. 내려받기와 올리기를 따로 재시도한다.
+
+    올리기가 성공하면 파일을 지운다 (keep_spool_files 면 남김). 실패하면 남겨 두어 다음 실행에서 재사용한다.
+    """
+    config, table = ctx.config, ctx.table
+    path = _spool_path(config, table.name)
+    meta_path = _spool_meta_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    meta = _reusable_spool(path, table)
+    if meta is not None:
+        ctx.on_event(
+            Event(
+                "warning",
+                f"{table.name}: 이전에 내려받은 파일을 재사용합니다 ({meta['rows']:,} 행, {meta['dumped_at']} 기준). "
+                f"새로 받으려면 {path} 를 지우세요",
+                table=table.name,
+            )
+        )
+    else:
+        ctx.phase(f"소스에서 내려받는 중 → {path}")
+        t0 = time.monotonic()
+
+        def download() -> int:
+            return dump_table(
+                ctx.conns.src,
+                config.source.schema,
+                table,
+                path,
+                on_progress=ctx.progress_handler("내려받기", {"read": "소스에서 다음 데이터 수신", "write": "파일 쓰기"}),
+                progress_interval=config.progress_interval,
+                stall_timeout=config.stall_timeout,
+            )
+
+        rows = ctx.with_retries("내려받기", download, source=True, dest=False)
+        meta = {
+            "table": table.name,
+            "columns": list(table.columns),
+            "where": table.where,
+            "rows": rows,
+            "dumped_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        ctx.phase(
+            f"내려받기 완료 ({rows:,} 행, {_fmt_bytes(path.stat().st_size)}, {time.monotonic() - t0:.0f}s), "
+            "대상으로 올리는 중"
+        )
+
+    def upload() -> int:
+        rows = load_table(
+            ctx.conns.dst,
+            config.destination.schema,
+            table,
+            path,
+            disable_triggers=config.disable_triggers,
+            reset_sequences=config.reset_sequences,
+            on_progress=ctx.progress_handler("올리기", {"read": "파일 읽기", "write": "대상 처리"}),
+            on_phase=ctx.phase,
+            progress_interval=config.progress_interval,
+            stall_timeout=config.stall_timeout,
+        )
+        ctx.conns.dst.commit()
+        return rows
+
+    rows = ctx.with_retries("올리기", upload, source=False, dest=True)
+
+    if not config.keep_spool_files:
+        path.unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+    return rows
+
+
 def execute_plan(
     config: MigrationConfig,
     plan: MigrationPlan,
@@ -304,40 +504,16 @@ def execute_plan(
                 on_event(Event("table_done", result.message, table=table.name, result=result))
                 continue
 
-            on_event(Event("table_start", f"{table.mode} 복사 시작", table=table.name))
+            via = " (파일 경유)" if config.transfer == "file" else ""
+            on_event(Event("table_start", f"{table.mode} 복사 시작{via}", table=table.name))
             started = time.monotonic()
-
-            def on_progress(p: Progress, _name: str = table.name, _t0: float = started) -> None:
-                elapsed = time.monotonic() - _t0
-                if p.idle_seconds >= config.progress_interval:
-                    # 데이터가 흐르지 않는 상태. 어느 쪽을 기다리는지 같이 보여준다.
-                    waiting = "소스에서 다음 데이터 수신" if p.phase == "read" else "대상으로 전송"
-                    message = (
-                        f"{p.rows:,} 행 / {_fmt_bytes(p.bytes)} 전송 후 {p.idle_seconds:.0f}초째 데이터 없음, "
-                        f"{waiting} 대기 중 ({elapsed:.0f}s)"
-                    )
-                else:
-                    message = f"{p.rows:,} 행 / {_fmt_bytes(p.bytes)} 전송 중 ({elapsed:.0f}s)"
-                on_event(Event("table_progress", message, table=_name, rows=p.rows, bytes=p.bytes))
-
-            def on_phase(message: str, _name: str = table.name) -> None:
-                on_event(Event("table_progress", message, table=_name))
+            ctx = _TableContext(config, conns, table, on_event, started)
 
             try:
-                rows = copy_table(
-                    conns.src,
-                    conns.dst,
-                    config.source.schema,
-                    config.destination.schema,
-                    table,
-                    disable_triggers=config.disable_triggers,
-                    reset_sequences=config.reset_sequences,
-                    on_progress=on_progress if config.progress_interval > 0 else None,
-                    on_phase=on_phase,
-                    progress_interval=config.progress_interval,
-                    stall_timeout=config.stall_timeout,
-                )
-                conns.dst.commit()
+                if config.transfer == "file":
+                    rows = _copy_via_file(ctx)
+                else:
+                    rows = _copy_streaming(ctx)
                 result = TableResult(table.name, "success", rows=rows, elapsed=time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - 테이블 단위로 격리하고 계속 진행
                 _safe_rollback(conns.dst)

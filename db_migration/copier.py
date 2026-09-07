@@ -1,4 +1,10 @@
-"""테이블 하나를 소스에서 대상으로 COPY 스트리밍으로 복사."""
+"""테이블 하나를 소스에서 대상으로 복사.
+
+두 가지 전송 방식을 지원한다.
+- stream: 소스 COPY TO 출력을 대상 COPY FROM 입력으로 그대로 흘려보낸다 (copy_table).
+- file  : 소스를 로컬 파일로 내려받은 뒤 (dump_table) 그 파일을 대상으로 올린다 (load_table).
+          두 단계가 분리되어 있어 한쪽 연결이 끊겨도 그 단계만 다시 하면 된다.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Literal
 
 import psycopg
@@ -13,6 +20,9 @@ from psycopg import sql
 
 from .db import qualified
 from .models import TablePlan
+
+# 파일에서 대상으로 올릴 때 한 번에 읽는 크기
+_FILE_CHUNK = 1024 * 1024
 
 
 def _column_list(columns: tuple[str, ...]) -> sql.Composed:
@@ -34,7 +44,7 @@ class Progress:
 
     rows: int
     bytes: int
-    phase: Literal["read", "write"]  # 지금 어느 쪽 소켓을 기다리는 중인지
+    phase: Literal["read", "write"]  # 지금 어느 쪽을 기다리는 중인지 (read: 소스/파일 읽기, write: 대상/파일 쓰기)
     idle_seconds: float  # 마지막으로 데이터가 흐른 뒤 지난 시간
 
 
@@ -64,12 +74,22 @@ def _shutdown_socket(conn: psycopg.Connection) -> None:
 
 
 class _StreamState:
-    """스트리밍 스레드와 감시 스레드가 공유하는 카운터."""
+    """전송 스레드와 감시 스레드가 공유하는 카운터."""
 
     def __init__(self) -> None:
         self.rows = 0
         self.bytes = 0
         self.phase: Literal["read", "write"] = "read"
+        self.last_data_at = time.monotonic()
+
+    def record(self, chunk: bytes | memoryview) -> None:
+        """chunk 하나를 전송한 뒤 카운터를 갱신.
+
+        텍스트 COPY 포맷은 행마다 개행 하나이고 데이터 안의 개행은 이스케이프되므로,
+        개행 수를 세면 파싱 없이 행 수를 알 수 있다. psycopg 는 memoryview 로 주므로 bytes 로 바꿔 센다.
+        """
+        self.rows += bytes(chunk).count(b"\n")
+        self.bytes += len(chunk)
         self.last_data_at = time.monotonic()
 
     def snapshot(self) -> Progress:
@@ -78,6 +98,72 @@ class _StreamState:
             bytes=self.bytes,
             phase=self.phase,
             idle_seconds=time.monotonic() - self.last_data_at,
+        )
+
+
+class _Watchdog:
+    """전송 중 진행 보고와 정지 감지를 담당하는 감시 스레드.
+
+    progress_interval 초마다 진행 상황을 보고하고, stall_timeout 초 동안 데이터가 전혀 흐르지 않으면
+    지정된 연결의 소켓을 닫아 본 스레드를 깨운다. 소켓 대기로 본 스레드가 막혀 있어도
+    감시 스레드는 계속 돌기 때문에 무한 대기가 없다.
+    """
+
+    def __init__(
+        self,
+        state: _StreamState,
+        connections: list[psycopg.Connection],
+        on_progress: ProgressCallback | None,
+        progress_interval: float,
+        stall_timeout: float,
+    ) -> None:
+        self.state = state
+        self.connections = connections
+        self.on_progress = on_progress
+        self.progress_interval = progress_interval
+        self.stall_timeout = stall_timeout
+        self.stalled = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def _report_enabled(self) -> bool:
+        return self.on_progress is not None and self.progress_interval > 0
+
+    def _run(self) -> None:
+        # 1초 단위로 깨어나 보고 주기와 정지 여부를 확인한다.
+        tick = min(1.0, self.progress_interval) if self._report_enabled else 1.0
+        last_report = time.monotonic()
+        while not self._stop.wait(tick):
+            snap = self.state.snapshot()
+            if self.stall_timeout > 0 and snap.idle_seconds >= self.stall_timeout:
+                self.stalled.set()
+                for conn in self.connections:
+                    _shutdown_socket(conn)
+                return
+            if self._report_enabled and time.monotonic() - last_report >= self.progress_interval:
+                self.on_progress(snap)  # type: ignore[misc]
+                last_report = time.monotonic()
+
+    def __enter__(self) -> _Watchdog:
+        if self._report_enabled or self.stall_timeout > 0:
+            self._thread = threading.Thread(target=self._run, name="copy-watchdog", daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def translate(self, exc: BaseException, waiting: dict[str, str]) -> BaseException:
+        """정지 감지로 소켓을 닫아서 난 예외라면 StallError 로 바꾼다. 아니면 원래 예외를 돌려준다."""
+        if not self.stalled.is_set():
+            return exc
+        snap = self.state.snapshot()
+        return StallError(
+            f"{self.stall_timeout:.0f}초 동안 데이터가 없어 중단 ({waiting[snap.phase]} 대기 중, "
+            f"{snap.rows:,} 행 전송된 상태). 연결을 끊고 재접속합니다"
         )
 
 
@@ -90,65 +176,84 @@ def _stream(
     progress_interval: float = 5.0,
     stall_timeout: float = 0.0,
 ) -> None:
-    """소스 COPY TO 출력을 대상 COPY FROM 입력으로 그대로 흘려보낸다.
-
-    별도 감시 스레드가 progress_interval 초마다 진행 상황을 보고하고, stall_timeout 초 동안
-    데이터가 전혀 흐르지 않으면 양쪽 소켓을 닫아 본 스레드를 깨운 뒤 StallError 를 낸다.
-    소켓 대기로 본 스레드가 막혀 있어도 감시 스레드는 계속 돌기 때문에 무한 대기가 없다.
-
-    텍스트 COPY 포맷은 행마다 개행 하나이고 데이터 안의 개행은 이스케이프되므로,
-    개행 수를 세면 파싱 없이 행 수를 알 수 있다.
-    """
+    """소스 COPY TO 출력을 대상 COPY FROM 입력으로 그대로 흘려보낸다."""
     state = _StreamState()
-    stop = threading.Event()
-    stalled = threading.Event()
-    report_enabled = on_progress is not None and progress_interval > 0
-    stall_enabled = stall_timeout > 0
-
-    def watchdog() -> None:
-        # 진행 보고와 정지 감지를 한 스레드에서 처리. 1초 단위로 깨어나 각각의 주기를 확인한다.
-        tick = min(1.0, progress_interval if report_enabled else 1.0)
-        last_report = time.monotonic()
-        while not stop.wait(tick):
-            snap = state.snapshot()
-            if stall_enabled and snap.idle_seconds >= stall_timeout:
-                stalled.set()
-                _shutdown_socket(src_cur.connection)
-                _shutdown_socket(dst_cur.connection)
-                return
-            if report_enabled and time.monotonic() - last_report >= progress_interval:
-                on_progress(snap)  # type: ignore[misc]
-                last_report = time.monotonic()
-
-    thread: threading.Thread | None = None
-    if report_enabled or stall_enabled:
-        thread = threading.Thread(target=watchdog, name="copy-watchdog", daemon=True)
-        thread.start()
-
-    try:
-        with src_cur.copy(src_sql) as src_copy:
-            with dst_cur.copy(dst_sql) as dst_copy:
+    connections = [src_cur.connection, dst_cur.connection]
+    with _Watchdog(state, connections, on_progress, progress_interval, stall_timeout) as wd:
+        try:
+            with src_cur.copy(src_sql) as src_copy, dst_cur.copy(dst_sql) as dst_copy:
                 for chunk in src_copy:
                     state.phase = "write"
                     dst_copy.write(chunk)
-                    # psycopg 는 chunk 를 memoryview 로 주므로 bytes 로 바꿔 개행을 센다
-                    state.rows += bytes(chunk).count(b"\n")
-                    state.bytes += len(chunk)
-                    state.last_data_at = time.monotonic()
+                    state.record(chunk)
                     state.phase = "read"
-    except Exception as exc:
-        if stalled.is_set():
-            snap = state.snapshot()
-            waiting = "소스 수신" if snap.phase == "read" else "대상 전송"
-            raise StallError(
-                f"{stall_timeout:.0f}초 동안 데이터가 없어 중단 ({waiting} 대기 중, "
-                f"{snap.rows:,} 행 전송된 상태). 연결을 끊고 재접속합니다"
-            ) from exc
+        except Exception as exc:
+            raise wd.translate(exc, {"read": "소스 수신", "write": "대상 전송"}) from exc
+
+
+def dump_table(
+    src: psycopg.Connection,
+    src_schema: str,
+    plan: TablePlan,
+    path: Path,
+    on_progress: ProgressCallback | None = None,
+    progress_interval: float = 5.0,
+    stall_timeout: float = 0.0,
+) -> int:
+    """소스 테이블을 COPY 텍스트 포맷으로 path 에 내려받고 행 수를 반환.
+
+    쓰는 동안은 path + ".part" 에 쓰고 끝나면 path 로 이름을 바꾸므로, path 가 존재하면 완전한 파일이다.
+    실패하면 .part 파일은 지운다.
+    """
+    part = path.with_name(path.name + ".part")
+    state = _StreamState()
+    try:
+        with (
+            src.cursor() as cur,
+            part.open("wb") as f,
+            _Watchdog(state, [src], on_progress, progress_interval, stall_timeout) as wd,
+        ):
+            try:
+                with cur.copy(_source_copy_sql(src_schema, plan)) as src_copy:
+                    for chunk in src_copy:
+                        state.phase = "write"
+                        f.write(chunk)
+                        state.record(chunk)
+                        state.phase = "read"
+            except Exception as exc:
+                raise wd.translate(exc, {"read": "소스 수신", "write": "파일 쓰기"}) from exc
+    except BaseException:
+        part.unlink(missing_ok=True)
         raise
-    finally:
-        stop.set()
-        if thread is not None:
-            thread.join()
+    part.replace(path)
+    return state.rows
+
+
+def _upload_file(
+    dst_cur: psycopg.Cursor,
+    dst_sql: sql.Composed,
+    path: Path,
+    on_progress: ProgressCallback | None,
+    progress_interval: float,
+    stall_timeout: float,
+) -> None:
+    """로컬 파일 내용을 대상 COPY FROM 으로 올린다."""
+    state = _StreamState()
+    with (
+        path.open("rb") as f,
+        _Watchdog(state, [dst_cur.connection], on_progress, progress_interval, stall_timeout) as wd,
+    ):
+        try:
+            with dst_cur.copy(dst_sql) as dst_copy:
+                while chunk := f.read(_FILE_CHUNK):
+                    state.phase = "write"
+                    dst_copy.write(chunk)
+                    state.record(chunk)
+                    state.phase = "read"
+                # 파일을 다 읽은 뒤에는 대상이 COPY 를 마무리하기를 기다린다
+                state.phase = "write"
+        except Exception as exc:
+            raise wd.translate(exc, {"read": "파일 읽기", "write": "대상 전송"}) from exc
 
 
 def _upsert_sql(schema: str, plan: TablePlan, tmp_name: str) -> sql.Composed:
@@ -175,29 +280,26 @@ def _upsert_sql(schema: str, plan: TablePlan, tmp_name: str) -> sql.Composed:
     return insert
 
 
-def copy_table(
-    src: psycopg.Connection,
+# 대상 커서와 COPY FROM 문장을 받아 실제 데이터를 밀어 넣는 함수
+_Feeder = Callable[[psycopg.Cursor, sql.Composed], None]
+
+
+def _write_table(
     dst: psycopg.Connection,
-    src_schema: str,
     dst_schema: str,
     plan: TablePlan,
-    disable_triggers: bool = False,
-    reset_sequences: bool = True,
-    on_progress: ProgressCallback | None = None,
-    on_phase: Callable[[str], None] | None = None,
-    progress_interval: float = 5.0,
-    stall_timeout: float = 0.0,
+    feed: _Feeder,
+    disable_triggers: bool,
+    reset_sequences: bool,
+    on_phase: Callable[[str], None] | None,
 ) -> int:
-    """계획대로 테이블 하나를 복사하고 복사된 행 수를 반환.
+    """대상 쪽 처리(트리거, upsert 임시 테이블, 시퀀스)를 감싸고 feed 로 데이터를 넣는다. 행 수를 반환.
 
     대상 쪽 트랜잭션은 호출자가 시작/커밋/롤백을 관리한다. 이 함수는 예외를 그대로 던진다.
-    on_progress 는 전송 중 progress_interval 초마다, on_phase 는 단계가 바뀔 때 호출된다.
-    stall_timeout 초 동안 데이터가 없으면 StallError 를 내며, 이때 양쪽 연결은 끊긴 상태가 된다.
     """
     target = qualified(dst_schema, plan.name)
-    src_sql = _source_copy_sql(src_schema, plan)
 
-    with src.cursor() as src_cur, dst.cursor() as dst_cur:
+    with dst.cursor() as dst_cur:
         if disable_triggers:
             dst_cur.execute(sql.SQL("ALTER TABLE {} DISABLE TRIGGER USER").format(target))
 
@@ -212,14 +314,14 @@ def copy_table(
             dst_sql = sql.SQL("COPY {} ({}) FROM STDIN").format(
                 sql.Identifier(tmp_name), _column_list(plan.columns)
             )
-            _stream(src_cur, dst_cur, src_sql, dst_sql, on_progress, progress_interval, stall_timeout)
+            feed(dst_cur, dst_sql)
             if on_phase is not None:
                 on_phase(f"전송 완료 ({max(dst_cur.rowcount, 0):,} 행), 대상 테이블에 병합 중")
             dst_cur.execute(_upsert_sql(dst_schema, plan, tmp_name))
             rows = dst_cur.rowcount
         else:
             dst_sql = sql.SQL("COPY {} ({}) FROM STDIN").format(target, _column_list(plan.columns))
-            _stream(src_cur, dst_cur, src_sql, dst_sql, on_progress, progress_interval, stall_timeout)
+            feed(dst_cur, dst_sql)
             rows = dst_cur.rowcount
 
         if disable_triggers:
@@ -238,3 +340,53 @@ def copy_table(
                 )
 
     return max(rows, 0)
+
+
+def copy_table(
+    src: psycopg.Connection,
+    dst: psycopg.Connection,
+    src_schema: str,
+    dst_schema: str,
+    plan: TablePlan,
+    disable_triggers: bool = False,
+    reset_sequences: bool = True,
+    on_progress: ProgressCallback | None = None,
+    on_phase: Callable[[str], None] | None = None,
+    progress_interval: float = 5.0,
+    stall_timeout: float = 0.0,
+) -> int:
+    """소스에서 대상으로 스트리밍 방식으로 테이블 하나를 복사하고 복사된 행 수를 반환.
+
+    on_progress 는 전송 중 progress_interval 초마다, on_phase 는 단계가 바뀔 때 호출된다.
+    stall_timeout 초 동안 데이터가 없으면 StallError 를 내며, 이때 양쪽 연결은 끊긴 상태가 된다.
+    """
+    src_sql = _source_copy_sql(src_schema, plan)
+    with src.cursor() as src_cur:
+
+        def feed(dst_cur: psycopg.Cursor, dst_sql: sql.Composed) -> None:
+            _stream(src_cur, dst_cur, src_sql, dst_sql, on_progress, progress_interval, stall_timeout)
+
+        return _write_table(dst, dst_schema, plan, feed, disable_triggers, reset_sequences, on_phase)
+
+
+def load_table(
+    dst: psycopg.Connection,
+    dst_schema: str,
+    plan: TablePlan,
+    path: Path,
+    disable_triggers: bool = False,
+    reset_sequences: bool = True,
+    on_progress: ProgressCallback | None = None,
+    on_phase: Callable[[str], None] | None = None,
+    progress_interval: float = 5.0,
+    stall_timeout: float = 0.0,
+) -> int:
+    """dump_table 로 내려받은 파일을 대상 테이블에 올리고 복사된 행 수를 반환.
+
+    stall_timeout 초 동안 대상이 데이터를 받지 않으면 StallError 를 내며, 이때 대상 연결은 끊긴 상태가 된다.
+    """
+
+    def feed(dst_cur: psycopg.Cursor, dst_sql: sql.Composed) -> None:
+        _upload_file(dst_cur, dst_sql, path, on_progress, progress_interval, stall_timeout)
+
+    return _write_table(dst, dst_schema, plan, feed, disable_triggers, reset_sequences, on_phase)

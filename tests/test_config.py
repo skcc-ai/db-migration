@@ -167,3 +167,31 @@ def test_stall_timeout():
     assert parse_config(_base(stall_timeout=0)).stall_timeout == 0.0
     with pytest.raises(ConfigError, match="stall_timeout"):
         parse_config(_base(stall_timeout="soon"))
+
+
+def test_transfer_defaults_to_stream():
+    cfg = parse_config(_base())
+    assert cfg.transfer == "stream"
+    assert cfg.spool_dir is None
+    assert cfg.keep_spool_files is False
+    assert cfg.retries == 3
+    assert cfg.effective_spool_dir().name == "db-migration"
+
+
+def test_transfer_file_options(tmp_path):
+    cfg = parse_config(_base(transfer="file", spool_dir=str(tmp_path), keep_spool_files=True, retries=0))
+    assert cfg.transfer == "file"
+    assert cfg.effective_spool_dir() == tmp_path
+    assert cfg.keep_spool_files is True
+    assert cfg.retries == 0
+
+
+def test_invalid_transfer_options():
+    with pytest.raises(ConfigError, match="transfer"):
+        parse_config(_base(transfer="ftp"))
+    with pytest.raises(ConfigError, match="retries"):
+        parse_config(_base(retries=-1))
+    with pytest.raises(ConfigError, match="retries"):
+        parse_config(_base(retries=1.5))
+    with pytest.raises(ConfigError, match="spool_dir"):
+        parse_config(_base(spool_dir=""))
