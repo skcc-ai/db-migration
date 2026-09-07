@@ -322,3 +322,30 @@ def test_bad_where_marks_table_failed_in_dry_run(conn):
     orders = next(t for t in plan.tables if t.name == "orders")
     assert orders.precheck_status == "failed"
     assert "no_such_column" in orders.precheck_message
+
+
+def test_progress_events_are_emitted(conn):
+    conn.execute("INSERT INTO src.no_pk SELECT 'row' || g FROM generate_series(1, 5000) g")
+    events: list[Event] = []
+    cfg = _config(copy_all=False, tables=["no_pk", "users"], progress_interval=0.0001)
+    _, result = run_migration(cfg, on_event=events.append)
+    assert result.succeeded
+    progress = [e for e in events if e.kind == "table_progress" and e.table == "no_pk" and e.rows is not None]
+    assert progress, "진행 이벤트가 없음"
+    assert progress[-1].rows <= 5002 and progress[-1].bytes > 0
+    # 시퀀스가 있는 users 는 단계 메시지도 나온다
+    assert any(e.kind == "table_progress" and e.table == "users" and "시퀀스" in e.message for e in events)
+
+
+def test_upsert_emits_merge_phase(conn):
+    events: list[Event] = []
+    _, result = run_migration(_config(mode="upsert", copy_all=False, tables=["users"]), on_event=events.append)
+    assert result.succeeded
+    assert any(e.kind == "table_progress" and "병합" in e.message for e in events)
+
+
+def test_progress_disabled_when_interval_zero(conn):
+    conn.execute("INSERT INTO src.no_pk SELECT 'row' || g FROM generate_series(1, 5000) g")
+    events: list[Event] = []
+    run_migration(_config(copy_all=False, tables=["no_pk"], progress_interval=0), on_event=events.append)
+    assert not [e for e in events if e.kind == "table_progress" and e.rows is not None]

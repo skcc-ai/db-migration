@@ -55,6 +55,7 @@ class MigrationConfig:
     disable_triggers: bool = False
     reset_sequences: bool = True
     count_rows_on_dry_run: bool = True
+    progress_interval: float = 5.0  # 복사 중 진행 상황 출력 간격(초). 0 이면 출력 안 함
 
     def table_spec(self, name: str) -> TableSpec:
         """이름으로 테이블 설정을 찾고, 없으면 기본 설정을 반환."""
@@ -190,6 +191,14 @@ def _parse_bool(raw: Any, label: str, default: bool) -> bool:
     return raw
 
 
+def _parse_number(raw: Any, label: str, default: float) -> float:
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+        raise ConfigError(f"{label} 는 0 이상의 숫자여야 합니다")
+    return float(raw)
+
+
 def parse_config(data: dict[str, Any]) -> MigrationConfig:
     """dict 형태의 설정을 검증하여 MigrationConfig 로 변환."""
     if not isinstance(data, dict):
@@ -210,6 +219,7 @@ def parse_config(data: dict[str, Any]) -> MigrationConfig:
         count_rows_on_dry_run=_parse_bool(
             data.get("count_rows_on_dry_run"), "count_rows_on_dry_run", True
         ),
+        progress_interval=_parse_number(data.get("progress_interval"), "progress_interval", 5.0),
     )
 
     if not config.copy_all and not config.tables:

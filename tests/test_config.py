@@ -153,3 +153,10 @@ def test_explicit_env_file(tmp_path, monkeypatch):
     assert conninfo_to_dict(cfg.source.dsn)["password"] == "prod"
     with pytest.raises(ConfigError, match="env 파일"):
         load_config(tmp_path / "config.yaml", env_file=tmp_path / "missing.env")
+
+
+def test_progress_interval():
+    assert parse_config(_base()).progress_interval == 5.0
+    assert parse_config(_base(progress_interval=0)).progress_interval == 0.0
+    with pytest.raises(ConfigError, match="progress_interval"):
+        parse_config(_base(progress_interval=-1))

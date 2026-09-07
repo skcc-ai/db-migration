@@ -53,6 +53,8 @@ def _make_listener(verbose: bool):
             print(event.message)
         elif event.kind == "table_start":
             print(f"  {event.table}: {event.message}", flush=True)
+        elif event.kind == "table_progress":
+            print(f"    {event.table}: {event.message}", flush=True)
         elif event.kind == "table_done" and event.result is not None:
             r = event.result
             if r.status == "success":

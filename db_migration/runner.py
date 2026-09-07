@@ -29,6 +29,16 @@ def _noop(_: Event) -> None:
     pass
 
 
+def _fmt_bytes(n: int) -> str:
+    """바이트 수를 읽기 쉬운 단위로."""
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
 def _first_line(exc: BaseException) -> str:
     """예외 메시지의 첫 줄만 반환 (Postgres 에러는 여러 줄인 경우가 많음)."""
     text = str(exc).strip()
@@ -238,6 +248,21 @@ def execute_plan(
 
             on_event(Event("table_start", f"{table.mode} 복사 시작", table=table.name))
             started = time.monotonic()
+
+            def on_progress(rows: int, nbytes: int, _name: str = table.name, _t0: float = started) -> None:
+                on_event(
+                    Event(
+                        "table_progress",
+                        f"{rows:,} 행 / {_fmt_bytes(nbytes)} 전송 중 ({time.monotonic() - _t0:.0f}s)",
+                        table=_name,
+                        rows=rows,
+                        bytes=nbytes,
+                    )
+                )
+
+            def on_phase(message: str, _name: str = table.name) -> None:
+                on_event(Event("table_progress", message, table=_name))
+
             try:
                 rows = copy_table(
                     src,
@@ -247,6 +272,9 @@ def execute_plan(
                     table,
                     disable_triggers=config.disable_triggers,
                     reset_sequences=config.reset_sequences,
+                    on_progress=on_progress if config.progress_interval > 0 else None,
+                    on_phase=on_phase,
+                    progress_interval=config.progress_interval,
                 )
                 dst.commit()
                 result = TableResult(table.name, "success", rows=rows, elapsed=time.monotonic() - started)

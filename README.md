@@ -92,6 +92,7 @@ count_rows_on_dry_run: true
 | `disable_triggers` | 복사 중 대상 테이블의 사용자 트리거 비활성화 (테이블 소유자 권한 필요) |
 | `reset_sequences` | 복사 후 컬럼에 연결된 시퀀스를 MAX 값으로 재설정 |
 | `count_rows_on_dry_run` | dry-run 에서 where 조건이 있는 테이블의 실제 count 수행 여부 |
+| `progress_interval` | 복사 중 진행 상황(전송 행 수, 용량) 출력 간격(초). 기본 5, 0 이면 출력 안 함 |
 
 ## 복사 모드별 동작
 
@@ -109,6 +110,12 @@ count_rows_on_dry_run: true
 - 대상은 테이블마다 별도 트랜잭션입니다. 실패한 테이블은 롤백되고, 그 테이블을 FK 로 참조하는 하위 테이블은 자동으로 건너뜁니다.
 - 실행 전 검사에서 걸리는 항목: 대상에 테이블 없음(`copy_all` 이면 경고 후 건너뜀, 명시 지정이면 실패), 소스 컬럼이 대상에 없음, upsert 인데 PK/unique 없음, where 절 문법 오류.
 - 대상에 추가 컬럼이 있으면 default 값으로 채워집니다. generated 컬럼은 양쪽 모두 복사에서 제외됩니다.
+
+## 연결 설정
+
+- 모든 연결에 TCP keepalive 를 켭니다 (30초 유휴 후 10초 간격 3회, 약 1분 안에 끊긴 연결 감지). VPN 이나 방화벽이 유휴 연결을 조용히 끊어도 무한 대기하지 않고 해당 테이블이 실패 처리됩니다.
+- 접속 대기는 15초, `application_name` 은 `db-migration` 으로 설정되어 `pg_stat_activity` 에서 찾기 쉽습니다.
+- 위 값들은 `dsn` 에 같은 키를 직접 적으면 덮어쓸 수 있습니다. 예: `dsn: "keepalives_idle=60 ..."`.
 
 ## 프로그램에서 사용하기
 

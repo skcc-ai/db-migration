@@ -69,3 +69,6 @@ reset_sequences: true
 # dry-run 에서 where 조건이 있는 테이블의 실제 행 수를 count 할지 여부
 # (대용량 테이블에서 느릴 수 있으면 false)
 count_rows_on_dry_run: true
+
+# 복사 중 진행 상황(전송 행 수, 용량)을 출력하는 간격(초). 0 이면 출력하지 않음
+progress_interval: 5

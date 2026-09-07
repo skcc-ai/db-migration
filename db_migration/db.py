@@ -6,6 +6,19 @@ from dataclasses import dataclass
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+# 네트워크 장비가 유휴 연결을 조용히 끊었을 때 무한 대기하지 않도록 TCP keepalive 를 켠다.
+# 30초 유휴 후 10초 간격으로 3번 응답이 없으면 (약 1분) 연결 끊김으로 판정한다.
+# DSN 이나 설정에 같은 키를 직접 적으면 그 값이 우선한다.
+_CONNECT_DEFAULTS: dict[str, str | int] = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "connect_timeout": 15,
+    "application_name": "db-migration",
+}
 
 
 @dataclass(frozen=True)
@@ -22,7 +35,10 @@ def connect(dsn: str, schema: str) -> psycopg.Connection:
 
     search_path 를 고정해 두면 where 절 안에서 스키마 없이 테이블명을 써도 해당 스키마로 해석된다.
     """
-    conn = psycopg.connect(dsn, autocommit=False)
+    params = conninfo_to_dict(dsn)
+    for key, value in _CONNECT_DEFAULTS.items():
+        params.setdefault(key, value)
+    conn = psycopg.connect(make_conninfo(**params), autocommit=False)
     with conn.cursor() as cur:
         cur.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
     conn.commit()

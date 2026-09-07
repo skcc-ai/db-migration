@@ -64,10 +64,12 @@ class MigrationResult:
 class Event:
     """진행 상황 알림. UI 나 CLI 에서 구독한다."""
 
-    kind: Literal["warning", "info", "table_start", "table_done", "truncate"]
+    kind: Literal["warning", "info", "table_start", "table_progress", "table_done", "truncate"]
     message: str
     table: str | None = None
     result: TableResult | None = None
+    rows: int | None = None  # table_progress: 지금까지 전송된 행 수
+    bytes: int | None = None  # table_progress: 지금까지 전송된 바이트
 
 
 EventListener = Callable[[Event], None]
