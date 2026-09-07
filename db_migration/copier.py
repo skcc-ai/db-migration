@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Literal
 
 import psycopg
 from psycopg import sql
@@ -25,8 +27,35 @@ def _source_copy_sql(schema: str, plan: TablePlan) -> sql.Composed:
     return sql.SQL("COPY ({}) TO STDOUT").format(select)
 
 
-# (전송된 행 수, 전송된 바이트) 를 받는 진행 콜백
-ProgressCallback = Callable[[int, int], None]
+@dataclass
+class Progress:
+    """전송 진행 상태 스냅샷."""
+
+    rows: int
+    bytes: int
+    phase: Literal["read", "write"]  # 지금 어느 쪽 소켓을 기다리는 중인지
+    idle_seconds: float  # 마지막으로 데이터가 흐른 뒤 지난 시간
+
+
+ProgressCallback = Callable[[Progress], None]
+
+
+class _StreamState:
+    """스트리밍 스레드와 리포터 스레드가 공유하는 카운터."""
+
+    def __init__(self) -> None:
+        self.rows = 0
+        self.bytes = 0
+        self.phase: Literal["read", "write"] = "read"
+        self.last_data_at = time.monotonic()
+
+    def snapshot(self) -> Progress:
+        return Progress(
+            rows=self.rows,
+            bytes=self.bytes,
+            phase=self.phase,
+            idle_seconds=time.monotonic() - self.last_data_at,
+        )
 
 
 def _stream(
@@ -39,24 +68,39 @@ def _stream(
 ) -> None:
     """소스 COPY TO 출력을 대상 COPY FROM 입력으로 그대로 흘려보낸다.
 
+    진행 상황은 별도 스레드가 progress_interval 초마다 보고한다. 소켓 대기로 본 스레드가
+    막혀 있어도 계속 찍히므로, 느린 것과 멈춘 것을 구분할 수 있다.
+
     텍스트 COPY 포맷은 행마다 개행 하나이고 데이터 안의 개행은 이스케이프되므로,
     개행 수를 세면 파싱 없이 행 수를 알 수 있다.
     """
-    rows = 0
-    total_bytes = 0
-    last_report = time.monotonic()
-    with src_cur.copy(src_sql) as src_copy:
-        with dst_cur.copy(dst_sql) as dst_copy:
-            for chunk in src_copy:
-                dst_copy.write(chunk)
-                # psycopg 는 chunk 를 memoryview 로 주므로 bytes 로 바꿔 개행을 센다
-                rows += bytes(chunk).count(b"\n")
-                total_bytes += len(chunk)
-                if on_progress is not None:
-                    now = time.monotonic()
-                    if now - last_report >= progress_interval:
-                        on_progress(rows, total_bytes)
-                        last_report = now
+    state = _StreamState()
+    stop = threading.Event()
+
+    def reporter() -> None:
+        while not stop.wait(progress_interval):
+            on_progress(state.snapshot())  # type: ignore[misc]
+
+    thread: threading.Thread | None = None
+    if on_progress is not None and progress_interval > 0:
+        thread = threading.Thread(target=reporter, name="copy-progress", daemon=True)
+        thread.start()
+
+    try:
+        with src_cur.copy(src_sql) as src_copy:
+            with dst_cur.copy(dst_sql) as dst_copy:
+                for chunk in src_copy:
+                    state.phase = "write"
+                    dst_copy.write(chunk)
+                    # psycopg 는 chunk 를 memoryview 로 주므로 bytes 로 바꿔 개행을 센다
+                    state.rows += bytes(chunk).count(b"\n")
+                    state.bytes += len(chunk)
+                    state.last_data_at = time.monotonic()
+                    state.phase = "read"
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join()
 
 
 def _upsert_sql(schema: str, plan: TablePlan, tmp_name: str) -> sql.Composed:

@@ -9,7 +9,7 @@ from psycopg import sql
 
 from . import db
 from .config import MigrationConfig
-from .copier import copy_table
+from .copier import Progress, copy_table
 from .models import (
     Event,
     EventListener,
@@ -249,16 +249,18 @@ def execute_plan(
             on_event(Event("table_start", f"{table.mode} 복사 시작", table=table.name))
             started = time.monotonic()
 
-            def on_progress(rows: int, nbytes: int, _name: str = table.name, _t0: float = started) -> None:
-                on_event(
-                    Event(
-                        "table_progress",
-                        f"{rows:,} 행 / {_fmt_bytes(nbytes)} 전송 중 ({time.monotonic() - _t0:.0f}s)",
-                        table=_name,
-                        rows=rows,
-                        bytes=nbytes,
+            def on_progress(p: Progress, _name: str = table.name, _t0: float = started) -> None:
+                elapsed = time.monotonic() - _t0
+                if p.idle_seconds >= config.progress_interval:
+                    # 데이터가 흐르지 않는 상태. 어느 쪽을 기다리는지 같이 보여준다.
+                    waiting = "소스에서 다음 데이터 수신" if p.phase == "read" else "대상으로 전송"
+                    message = (
+                        f"{p.rows:,} 행 / {_fmt_bytes(p.bytes)} 전송 후 {p.idle_seconds:.0f}초째 데이터 없음, "
+                        f"{waiting} 대기 중 ({elapsed:.0f}s)"
                     )
-                )
+                else:
+                    message = f"{p.rows:,} 행 / {_fmt_bytes(p.bytes)} 전송 중 ({elapsed:.0f}s)"
+                on_event(Event("table_progress", message, table=_name, rows=p.rows, bytes=p.bytes))
 
             def on_phase(message: str, _name: str = table.name) -> None:
                 on_event(Event("table_progress", message, table=_name))

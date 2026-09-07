@@ -325,14 +325,14 @@ def test_bad_where_marks_table_failed_in_dry_run(conn):
 
 
 def test_progress_events_are_emitted(conn):
-    conn.execute("INSERT INTO src.no_pk SELECT 'row' || g FROM generate_series(1, 5000) g")
+    conn.execute("INSERT INTO src.no_pk SELECT 'row' || g FROM generate_series(1, 300000) g")
     events: list[Event] = []
-    cfg = _config(copy_all=False, tables=["no_pk", "users"], progress_interval=0.0001)
+    cfg = _config(copy_all=False, tables=["no_pk", "users"], progress_interval=0.05)
     _, result = run_migration(cfg, on_event=events.append)
     assert result.succeeded
     progress = [e for e in events if e.kind == "table_progress" and e.table == "no_pk" and e.rows is not None]
     assert progress, "진행 이벤트가 없음"
-    assert progress[-1].rows <= 5002 and progress[-1].bytes > 0
+    assert progress[-1].rows <= 300002 and progress[-1].bytes > 0
     # 시퀀스가 있는 users 는 단계 메시지도 나온다
     assert any(e.kind == "table_progress" and e.table == "users" and "시퀀스" in e.message for e in events)
 
@@ -349,3 +349,18 @@ def test_progress_disabled_when_interval_zero(conn):
     events: list[Event] = []
     run_migration(_config(copy_all=False, tables=["no_pk"], progress_interval=0), on_event=events.append)
     assert not [e for e in events if e.kind == "table_progress" and e.rows is not None]
+
+
+def test_progress_reports_stall_while_waiting_for_source(conn):
+    # 행마다 pg_sleep 이 걸려 소스에서 데이터가 띄엄띄엄 오는 상황을 흉내낸다
+    events: list[Event] = []
+    cfg = _config(
+        copy_all=False,
+        tables=[{"name": "users", "where": "pg_sleep(0.6) IS NULL"}],
+        progress_interval=0.2,
+    )
+    _, result = run_migration(cfg, on_event=events.append)
+    assert result.succeeded
+    stalls = [e for e in events if e.kind == "table_progress" and "데이터 없음" in e.message]
+    assert stalls, [e.message for e in events]
+    assert any("소스에서 다음 데이터 수신" in e.message for e in stalls)
